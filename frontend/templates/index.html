@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>A2UI Explainable Workbench</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <header>
+        <h1>A2UI Explainable AI Workbench</h1>
+        <div class="user-info">Underwriter Portal</div>
+    </header>
+
+    <div class="main-container">
+        <!-- Topology Visualization Panel -->
+        <div class="panel topology-panel">
+            <div class="panel-header">Multi-Agent Mesh Topology</div>
+            <div id="topology-visualizer-container" class="terminal-content">
+                <p style="color: #888; text-align: center; margin-top: 50px;">Awaiting Orchestration Event Stream...</p>
+            </div>
+        </div>
+
+        <!-- Terminal & UI Delivery Panel -->
+        <div class="panel terminal-panel">
+            <div class="panel-header">Execution Trace & Dynamic Components</div>
+            <div id="chat-terminal-container" class="terminal-content">
+                <!-- Trace bubbles will be injected here -->
+            </div>
+            
+            <div class="action-bar">
+                <input type="text" id="prompt-input" value="Execute generic master workflow system pattern" style="flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px;" />
+                <button id="run-btn" class="primary">Launch Workflow</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Load the Dynamic UI Engine -->
+    <script src="/static/js/app.js"></script>
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            const engine = new MultiAgentDynamicUiEngine(
+                "/api/chat/stream", 
+                "chat-terminal-container", 
+                "topology-visualizer-container"
+            );
+
+            document.getElementById("run-btn").addEventListener("click", () => {
+                const prompt = document.getElementById("prompt-input").value;
+                document.getElementById("chat-terminal-container").innerHTML = ""; // Clear
+                // system-generated-durable-id
+                engine.establishOrchestrationStream(prompt, "session-12345");
+            });
+        });
+    </script>
+</body>
+</html>
+
