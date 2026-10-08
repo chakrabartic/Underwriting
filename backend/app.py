@@ -7,19 +7,24 @@ runtime stabilization, centralized supervisor routing, and real-time JSON-RPC st
 import sys
 import json
 import logging
+import uuid
 from typing import Generator, Dict, Any
 from flask import Flask, Response, request, jsonify
 from flask_cors import CORS
 
+from backend.agents.intake import IntakeClearanceAgent
+from backend.agents.appetite import AppetiteEligibilityAgent
+from backend.agents.enrichment import DataEnrichmentAgent
+from backend.agents.exposure import ExposureRiskSummaryAgent
+from backend.agents.rating_engine import SymbolicRatingEngine
+from backend.agents.quote_gen import QuoteGenerationAgent
+from backend.agents.audit import AuditComplianceAgent
+
 # Setup structured logging for audit compliance
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
 
-# ==============================================================================
-# PATTERN: RUNTIME ENVIRONMENT STABILIZATION (MONKEYPATCHING boundary)
-# Dynamically aligns decoupled underlying framework structural dependencies at startup.
-# ==============================================================================
 try:
-    import math as mock_agent_sdk  # Simulating internal framework container drift
+    import math as mock_agent_sdk
     if not hasattr(mock_agent_sdk, "DataPart"):
         logging.warning("Import drift detected in agentic SDK types. Applying stabilization proxy.")
         setattr(mock_agent_sdk, "DataPart", type("DataPart", (object,), {"__init__": lambda s, d: setattr(s, "data", d)}))
@@ -29,47 +34,80 @@ except ImportError as exc:
     sys.exit(1)
 
 app = Flask(__name__)
-CORS(app)  # Enables clean deployment topology across independent network boundaries
+CORS(app)
 
-# ==============================================================================
-# PATTERN: SUPERVISOR ARCHITECTURE (Centralized Task Orchestrator Core)
-# Core multi-agent supervisor pattern handling execution and wiretapping trace loops.
-# ==============================================================================
 class SupervisorOrchestratorEngine:
     def __init__(self, session_id: str, declarative_intent: str):
         self.session_id = session_id
         self.intent = declarative_intent
-        # Shared Epistemic Context initialization
-        self.shared_context = {"session_id": session_id, "agent_execution_depth": 0}
+        self.shared_context = {"session_id": session_id}
 
     def execute_workflow(self) -> Generator[str, None, None]:
-        """
-        Executes decentralized step-decomposition loops across secondary worker nodes.
-        Yields JSON-RPC formatted trace logs detailing execution state transitions.
-        """
-        logging.info(f"Session {self.session_id}: Launching Supervisor Orchestration Loop.")
+        quote_id = f"QTE-{uuid.uuid4().hex[:6].upper()}"
+        gcs_uri = "gs://underwriting-submissions/submission.pdf"
         
-        # Frame 1: Internal Reason / Thought Pattern Event
         yield self._encode_rpc_frame("onAgentThought", {
             "author": "SupervisorAgentCore",
-            "message": f"Decomposing user request intent payload: '{self.intent}'."
+            "message": f"Orchestrating workflow for new submission: {quote_id}."
         })
 
-        # Frame 2: Specialist Worker Node Delegation Trigger Event
+        # 1. Intake
         yield self._encode_rpc_frame("onAgentDelegation", {
-            "author": "SupervisorAgentCore",
-            "target": "DomainSpecialistWorker_Alpha",
-            "message": "Routing analytical step execution boundary to Specialist Alpha."
+            "author": "SupervisorAgentCore", "target": "IntakeClearanceAgent", "message": "Routing to Doc AI Intake."
         })
-
-        # Frame 3: Resilient System Tool Invocation Trace Event
-        yield self._encode_rpc_frame("onToolCall", {
-            "author": "DomainSpecialistWorker_Alpha",
-            "tool": "EnterpriseKnowledgeGraphLookup",
-            "arguments": {"query": self.intent, "depth": 2}
+        intake_agent = IntakeClearanceAgent("test-proj", "us-central1", "proc-id", "bq-dataset")
+        intake_res = intake_agent.process_submission(gcs_uri, quote_id)
+        self.shared_context["intake"] = intake_res
+        
+        # 2. Appetite
+        yield self._encode_rpc_frame("onAgentDelegation", {
+            "author": "SupervisorAgentCore", "target": "AppetiteEligibilityAgent", "message": "Evaluating Appetite Rules."
         })
+        appetite_agent = AppetiteEligibilityAgent()
+        appetite_res = appetite_agent.evaluate(quote_id, intake_res["extracted_data"])
+        self.shared_context["appetite"] = appetite_res
 
-        # Frame 4: Dynamic UI Layout Schema Engine Delivery Event
+        # 3. Enrichment
+        yield self._encode_rpc_frame("onAgentDelegation", {
+            "author": "SupervisorAgentCore", "target": "DataEnrichmentAgent", "message": "Fetching 3rd-Party Data via Apigee."
+        })
+        enrich_agent = DataEnrichmentAgent()
+        enrich_res = enrich_agent.fetch_enrichment_data(quote_id, intake_res["extracted_data"])
+        self.shared_context["enrichment"] = enrich_res
+
+        # 4. Exposure Summary
+        yield self._encode_rpc_frame("onAgentDelegation", {
+            "author": "SupervisorAgentCore", "target": "ExposureRiskSummaryAgent", "message": "Synthesizing Risk Summary."
+        })
+        exposure_agent = ExposureRiskSummaryAgent("test-proj", "us-central1")
+        exposure_res = exposure_agent.synthesize(quote_id, intake_res["extracted_data"], enrich_res["enrichment_data"])
+        self.shared_context["exposure"] = exposure_res
+
+        # 5. Symbolic Rating (Deterministic)
+        yield self._encode_rpc_frame("onAgentDelegation", {
+            "author": "SupervisorAgentCore", "target": "SymbolicRatingEngine", "message": "Executing deterministic pricing."
+        })
+        rating_agent = SymbolicRatingEngine()
+        rating_res = rating_agent.calculate_premium(quote_id, intake_res["extracted_data"], enrich_res["enrichment_data"])
+        self.shared_context["rating"] = rating_res
+
+        # 6. Quote Gen
+        yield self._encode_rpc_frame("onAgentDelegation", {
+            "author": "SupervisorAgentCore", "target": "QuoteGenerationAgent", "message": "Generating final quote options."
+        })
+        quote_agent = QuoteGenerationAgent()
+        quote_res = quote_agent.generate_quote_options(quote_id, rating_res)
+        self.shared_context["quote"] = quote_res
+
+        # 7. Audit Compliance
+        yield self._encode_rpc_frame("onAgentDelegation", {
+            "author": "SupervisorAgentCore", "target": "AuditComplianceAgent", "message": "Generating Regulator-Ready Audit Pack."
+        })
+        audit_agent = AuditComplianceAgent()
+        audit_res = audit_agent.build_audit_pack(quote_id, self.shared_context)
+        self.shared_context["audit"] = audit_res
+
+        # Final UI Delivery - Render results dynamically
         yield self._encode_rpc_frame("onUiComponentDelivery", {
             "author": "SupervisorAgentCore",
             "ui_specification": "0.9",
@@ -78,31 +116,30 @@ class SupervisorOrchestratorEngine:
                 "id": "agent_execution_summary_tabs",
                 "components": [
                     {
-                        "title": "System Meta Metrics", 
-                        "type": "Table", 
-                        "headers": ["Orchestrator Node", "Status Code", "Confidence Index"], 
-                        "rows": [["SupervisorAgentCore", "COMPLETED", "98.7%"]]
+                        "title": "Risk Summary", 
+                        "type": "Card", 
+                        "content": exposure_res["summary"]
                     },
                     {
-                        "title": "Analytical Summary Output", 
+                        "title": "Pricing & Factors", 
+                        "type": "Table", 
+                        "headers": ["Factor", "Impact", "Rule ID"], 
+                        "rows": [[f["description"], f["impact"], f["rule_id"]] for f in rating_res.get("factors", [])]
+                    },
+                    {
+                        "title": "Audit Trail", 
                         "type": "Card", 
-                        "content": "The execution loop cleared boundaries smoothly. Sub-agent mesh state is stabilized."
+                        "content": f"Audit ID: {audit_res['audit_id']}. Deterministic Traces: {', '.join(rating_res['execution_trace'])}"
                     }
                 ]
             }
         })
 
     def _encode_rpc_frame(self, method: str, params: Dict[str, Any]) -> str:
-        """Wraps parameters into standardized data transmission blocks using standard data formatting."""
         return json.dumps({"jsonrpc": "2.0", "method": method, "params": params})
 
-# ==============================================================================
-# PATTERN: REACTIVE STREAMING CONTROLLER
-# Controller layer converting blocking / non-blocking generator chunks into an SSE stream.
-# ==============================================================================
 @app.route('/api/chat/stream', methods=['POST', 'GET'])
 def reactive_stream_endpoint() -> Response:
-    """Consumes client params and returns a persistent text/event-stream connection pipeline."""
     if request.method == 'POST':
         payload = request.get_json(silent=True) or {}
         prompt = payload.get("prompt", "Execute generic master workflow system pattern")
@@ -120,13 +157,8 @@ def reactive_stream_endpoint() -> Response:
     return Response(sse_event_encoder(), mimetype='text/event-stream', headers={
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no'  # Prevents proxy caching layers from blocking real-time chunks
+        'X-Accel-Buffering': 'no'
     })
-
-@app.route('/api/session', methods=['GET'])
-def session_context_manager() -> Response:
-    return jsonify({"session_id": "system-generated-durable-id", "lifecycle_state": "ACTIVE", "ttl": 3600})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
-
