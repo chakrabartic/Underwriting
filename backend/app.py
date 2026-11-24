@@ -33,8 +33,14 @@ except ImportError as exc:
     logging.critical(f"Critical System Boot Exception: Multi-agent framework components missing: {exc}")
     sys.exit(1)
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='../frontend/static', template_folder='../frontend/templates')
 CORS(app)
+
+from flask import render_template
+
+@app.route('/')
+def index():
+    return render_template('index.html')
 
 class SupervisorOrchestratorEngine:
     def __init__(self, session_id: str, declarative_intent: str):

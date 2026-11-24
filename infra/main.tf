@@ -96,3 +96,4 @@ resource "google_project_iam_member" "gcs_access" {
   role    = "roles/storage.objectAdmin"
   member  = "serviceAccount:${google_service_account.agent_identity.email}"
 }
+
