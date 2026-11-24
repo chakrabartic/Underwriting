@@ -1,170 +1,352 @@
-"""
-SYSTEM PATTERN: ENTERPRISE SUPERVISOR ARCHITECTURE WITH REACTIVE CONTROLLER
-This component demonstrates a production-ready multi-agent orchestration layer featuring
-runtime stabilization, centralized supervisor routing, and real-time JSON-RPC streaming via SSE.
+"""Flask application factory, REST endpoints, and SSE streaming controller.
+
+Exposes:
+- `GET /`: A2UI Explainable Underwriting Workbench
+- `GET /healthz`, `GET /readyz`: Cloud Run & GKE health probes
+- `GET /api/metrics`: Operational SLI/SLO telemetry snapshot
+- `GET /api/session`: Session bootstrap metadata
+- `POST|GET /api/chat/stream`: Real-time JSON-RPC 2.0 SSE orchestration stream
+- `POST /api/rating/calculate`: Isolated deterministic Symbolic Rating API (Spec 02)
+- `GET /api/quotes`: Quote Lifecycle Dashboard feed (Spec 05)
+- `GET /api/quotes/<quote_id>`: Shared Epistemic Memory dossier & citations
+- `GET /api/quotes/<quote_id>/audit`: Regulator-Ready Audit Pack export (Spec 03)
+- `POST /api/quotes/<quote_id>/decision`: Human-in-the-loop Referral Console resolution
 """
 
-import sys
-import json
-import logging
+from __future__ import annotations
+
+from collections.abc import Generator
+from pathlib import Path
+from typing import Any
 import uuid
-from typing import Generator, Dict, Any
-from flask import Flask, Response, request, jsonify
+
+from flask import Flask, Response, jsonify, render_template, request
 from flask_cors import CORS
+from pydantic import ValidationError
 
-from backend.agents.intake import IntakeClearanceAgent
-from backend.agents.appetite import AppetiteEligibilityAgent
-from backend.agents.enrichment import DataEnrichmentAgent
-from backend.agents.exposure import ExposureRiskSummaryAgent
-from backend.agents.rating_engine import SymbolicRatingEngine
-from backend.agents.quote_gen import QuoteGenerationAgent
 from backend.agents.audit import AuditComplianceAgent
+from backend.agents.intake import validate_gcs_uri
+from backend.agents.rating_engine import SymbolicRatingEngine
+from backend.compat import stabilize_a2a_runtime
+from backend.config import AppConfig
+from backend.memory import (
+    EpistemicMemoryStore,
+    InvalidLifecycleTransitionError,
+    QuoteNotFoundError,
+)
+from backend.metrics import OperationalMetricsRegistry
+from backend.models import QuoteLifecycleState, UnderwriterResolution
+from backend.orchestrator import SupervisorOrchestratorEngine
+from backend.security import AgentGatewayProxy, SpiffeIdentityProvider
 
-# Setup structured logging for audit compliance
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
+MAX_PROMPT_LENGTH = 4000
+MAX_SESSION_ID_LENGTH = 128
 
-try:
-    import math as mock_agent_sdk
-    if not hasattr(mock_agent_sdk, "DataPart"):
-        logging.warning("Import drift detected in agentic SDK types. Applying stabilization proxy.")
-        setattr(mock_agent_sdk, "DataPart", type("DataPart", (object,), {"__init__": lambda s, d: setattr(s, "data", d)}))
-        setattr(mock_agent_sdk, "TextPart", type("TextPart", (object,), {"__init__": lambda s, t: setattr(s, "text", t)}))
-except ImportError as exc:
-    logging.critical(f"Critical System Boot Exception: Multi-agent framework components missing: {exc}")
-    sys.exit(1)
+_FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-app = Flask(__name__, static_folder='../frontend/static', template_folder='../frontend/templates')
-CORS(app)
 
-from flask import render_template
+def create_app(
+    config: AppConfig | None = None,
+    *,
+    memory_store: EpistemicMemoryStore | None = None,
+    metrics: OperationalMetricsRegistry | None = None,
+    gateway: AgentGatewayProxy | None = None,
+) -> Flask:
+    """Application factory creating a hermetic, dependency-injected Flask app."""
+    resolved_config = config or AppConfig.from_env()
+    runtime_compat_status = stabilize_a2a_runtime()
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+    shared_memory = memory_store or EpistemicMemoryStore()
+    shared_metrics = metrics or OperationalMetricsRegistry()
+    shared_gateway = gateway or AgentGatewayProxy(
+        SpiffeIdentityProvider(
+            trust_domain=resolved_config.spiffe_trust_domain,
+            ttl_seconds=resolved_config.token_ttl_seconds,
+        )
+    )
 
-class SupervisorOrchestratorEngine:
-    def __init__(self, session_id: str, declarative_intent: str):
-        self.session_id = session_id
-        self.intent = declarative_intent
-        self.shared_context = {"session_id": session_id}
+    flask_app = Flask(
+        __name__,
+        static_folder=str(_FRONTEND_DIR / "static"),
+        template_folder=str(_FRONTEND_DIR / "templates"),
+    )
+    flask_app.config["UNDERWRITING_CONFIG"] = resolved_config
+    flask_app.extensions["epistemic_memory"] = shared_memory
+    flask_app.extensions["operational_metrics"] = shared_metrics
+    flask_app.extensions["agent_gateway"] = shared_gateway
 
-    def execute_workflow(self) -> Generator[str, None, None]:
-        quote_id = f"QTE-{uuid.uuid4().hex[:6].upper()}"
-        gcs_uri = "gs://underwriting-submissions/submission.pdf"
-        
-        yield self._encode_rpc_frame("onAgentThought", {
-            "author": "SupervisorAgentCore",
-            "message": f"Orchestrating workflow for new submission: {quote_id}."
-        })
+    CORS(
+        flask_app,
+        resources={
+            r"/api/*": {"origins": list(resolved_config.cors_allowed_origins)}
+        },
+    )
 
-        # 1. Intake
-        yield self._encode_rpc_frame("onAgentDelegation", {
-            "author": "SupervisorAgentCore", "target": "IntakeClearanceAgent", "message": "Routing to Doc AI Intake."
-        })
-        intake_agent = IntakeClearanceAgent("test-proj", "us-central1", "proc-id", "bq-dataset")
-        intake_res = intake_agent.process_submission(gcs_uri, quote_id)
-        self.shared_context["intake"] = intake_res
-        
-        # 2. Appetite
-        yield self._encode_rpc_frame("onAgentDelegation", {
-            "author": "SupervisorAgentCore", "target": "AppetiteEligibilityAgent", "message": "Evaluating Appetite Rules."
-        })
-        appetite_agent = AppetiteEligibilityAgent()
-        appetite_res = appetite_agent.evaluate(quote_id, intake_res["extracted_data"])
-        self.shared_context["appetite"] = appetite_res
+    @flask_app.after_request
+    def _apply_security_headers(response: Response) -> Response:
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault(
+            "Referrer-Policy", "strict-origin-when-cross-origin"
+        )
+        return response
 
-        # 3. Enrichment
-        yield self._encode_rpc_frame("onAgentDelegation", {
-            "author": "SupervisorAgentCore", "target": "DataEnrichmentAgent", "message": "Fetching 3rd-Party Data via Apigee."
-        })
-        enrich_agent = DataEnrichmentAgent()
-        enrich_res = enrich_agent.fetch_enrichment_data(quote_id, intake_res["extracted_data"])
-        self.shared_context["enrichment"] = enrich_res
+    @flask_app.route("/", methods=["GET"])
+    def index() -> str:
+        return render_template("index.html")
 
-        # 4. Exposure Summary
-        yield self._encode_rpc_frame("onAgentDelegation", {
-            "author": "SupervisorAgentCore", "target": "ExposureRiskSummaryAgent", "message": "Synthesizing Risk Summary."
-        })
-        exposure_agent = ExposureRiskSummaryAgent("test-proj", "us-central1")
-        exposure_res = exposure_agent.synthesize(quote_id, intake_res["extracted_data"], enrich_res["enrichment_data"])
-        self.shared_context["exposure"] = exposure_res
+    @flask_app.route("/healthz", methods=["GET"])
+    def healthz() -> tuple[Response, int]:
+        return jsonify({"status": "ok"}), 200
 
-        # 5. Symbolic Rating (Deterministic)
-        yield self._encode_rpc_frame("onAgentDelegation", {
-            "author": "SupervisorAgentCore", "target": "SymbolicRatingEngine", "message": "Executing deterministic pricing."
-        })
-        rating_agent = SymbolicRatingEngine()
-        rating_res = rating_agent.calculate_premium(quote_id, intake_res["extracted_data"], enrich_res["enrichment_data"])
-        self.shared_context["rating"] = rating_res
+    @flask_app.route("/readyz", methods=["GET"])
+    def readyz() -> tuple[Response, int]:
+        return (
+            jsonify({
+                "status": "ready",
+                "execution_mode": resolved_config.execution_mode.value,
+                "rating_engine_version": resolved_config.rating_engine_version,
+                "gemini_model": resolved_config.gemini_model,
+                "runtime_compat": runtime_compat_status,
+            }),
+            200,
+        )
 
-        # 6. Quote Gen
-        yield self._encode_rpc_frame("onAgentDelegation", {
-            "author": "SupervisorAgentCore", "target": "QuoteGenerationAgent", "message": "Generating final quote options."
-        })
-        quote_agent = QuoteGenerationAgent()
-        quote_res = quote_agent.generate_quote_options(quote_id, rating_res)
-        self.shared_context["quote"] = quote_res
+    @flask_app.route("/api/session", methods=["GET"])
+    def session_context_manager() -> tuple[Response, int]:
+        return (
+            jsonify({
+                "session_id": f"sess-{uuid.uuid4().hex[:12]}",
+                "lifecycle_state": "ACTIVE",
+                "ttl": resolved_config.token_ttl_seconds,
+            }),
+            200,
+        )
 
-        # 7. Audit Compliance
-        yield self._encode_rpc_frame("onAgentDelegation", {
-            "author": "SupervisorAgentCore", "target": "AuditComplianceAgent", "message": "Generating Regulator-Ready Audit Pack."
-        })
-        audit_agent = AuditComplianceAgent()
-        audit_res = audit_agent.build_audit_pack(quote_id, self.shared_context)
-        self.shared_context["audit"] = audit_res
+    @flask_app.route("/api/metrics", methods=["GET"])
+    def metrics_endpoint() -> tuple[Response, int]:
+        return (
+            jsonify({
+                **shared_metrics.snapshot(),
+                "quotes_by_state": shared_memory.counts_by_state(),
+                "gateway_authorized_calls": len([
+                    e for e in shared_gateway.get_audit_entries() if e.authorized
+                ]),
+                "gateway_denied_calls": len([
+                    e for e in shared_gateway.get_audit_entries() if not e.authorized
+                ]),
+            }),
+            200,
+        )
 
-        # Final UI Delivery - Render results dynamically
-        yield self._encode_rpc_frame("onUiComponentDelivery", {
-            "author": "SupervisorAgentCore",
-            "ui_specification": "0.9",
-            "payload": {
-                "type": "Tabs",
-                "id": "agent_execution_summary_tabs",
-                "components": [
-                    {
-                        "title": "Risk Summary", 
-                        "type": "Card", 
-                        "content": exposure_res["summary"]
-                    },
-                    {
-                        "title": "Pricing & Factors", 
-                        "type": "Table", 
-                        "headers": ["Factor", "Impact", "Rule ID"], 
-                        "rows": [[f["description"], f["impact"], f["rule_id"]] for f in rating_res.get("factors", [])]
-                    },
-                    {
-                        "title": "Audit Trail", 
-                        "type": "Card", 
-                        "content": f"Audit ID: {audit_res['audit_id']}. Deterministic Traces: {', '.join(rating_res['execution_trace'])}"
-                    }
-                ]
-            }
-        })
+    @flask_app.route("/api/chat/stream", methods=["POST", "GET"])
+    def reactive_stream_endpoint() -> Response | tuple[Response, int]:
+        if request.method == "POST":
+            payload = request.get_json(silent=True)
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                return jsonify({"error": "JSON request body must be an object."}), 400
+            prompt = str(
+                payload.get("prompt", "Execute commercial underwriting workflow")
+            )
+            session_id = str(
+                payload.get("session_id", "system-generated-durable-id")
+            )
+            raw_gcs_uri = payload.get("gcs_uri")
+        else:
+            prompt = request.args.get(
+                "prompt", "Execute commercial underwriting workflow"
+            )
+            session_id = request.args.get(
+                "session_id", "system-generated-durable-id"
+            )
+            raw_gcs_uri = request.args.get("gcs_uri")
 
-    def _encode_rpc_frame(self, method: str, params: Dict[str, Any]) -> str:
-        return json.dumps({"jsonrpc": "2.0", "method": method, "params": params})
+        if len(prompt) > MAX_PROMPT_LENGTH:
+            return (
+                jsonify({
+                    "error": f"prompt exceeds maximum length of {MAX_PROMPT_LENGTH}."
+                }),
+                400,
+            )
+        if len(session_id) > MAX_SESSION_ID_LENGTH:
+            return (
+                jsonify({
+                    "error": (
+                        f"session_id exceeds maximum length of {MAX_SESSION_ID_LENGTH}."
+                    )
+                }),
+                400,
+            )
 
-@app.route('/api/chat/stream', methods=['POST', 'GET'])
-def reactive_stream_endpoint() -> Response:
-    if request.method == 'POST':
-        payload = request.get_json(silent=True) or {}
-        prompt = payload.get("prompt", "Execute generic master workflow system pattern")
-        session_id = payload.get("session_id", "system-generated-durable-id")
-    else:
-        prompt = request.args.get("prompt", "Execute generic master workflow system pattern")
-        session_id = request.args.get("session_id", "system-generated-durable-id")
+        validated_uri: str | None = None
+        if raw_gcs_uri:
+            try:
+                validated_uri = validate_gcs_uri(str(raw_gcs_uri))
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
 
-    orchestration_instance = SupervisorOrchestratorEngine(session_id=session_id, declarative_intent=prompt)
-    
-    def sse_event_encoder() -> Generator[str, None, None]:
-        for trace_chunk in orchestration_instance.execute_workflow():
-            yield f"data: {trace_chunk}\n\n"
+        orchestrator = SupervisorOrchestratorEngine(
+            session_id=session_id,
+            declarative_intent=prompt,
+            gcs_uri=validated_uri,
+            config=resolved_config,
+            memory_store=shared_memory,
+            gateway=shared_gateway,
+            metrics=shared_metrics,
+        )
 
-    return Response(sse_event_encoder(), mimetype='text/event-stream', headers={
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no'
-    })
+        def sse_event_encoder() -> Generator[str, None, None]:
+            for trace_chunk in orchestrator.execute_workflow():
+                yield f"data: {trace_chunk}\n\n"
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+        return Response(
+            sse_event_encoder(),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @flask_app.route("/api/rating/calculate", methods=["POST"])
+    def symbolic_rating_endpoint() -> tuple[Response, int]:
+        """Isolated REST API for the deterministic Symbolic Rating Engine (Spec 02)."""
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "Expected JSON object payload."}), 400
+
+        quote_id = str(payload.get("quote_id", "")).strip()
+        extracted_entities = payload.get("extracted_entities")
+        enrichment_data = payload.get("enrichment_data")
+        rule_version = str(
+            payload.get("rule_version", resolved_config.rating_engine_version)
+        ).strip()
+        appetite_decision = payload.get("appetite_decision")
+
+        if not quote_id:
+            return jsonify({"error": "quote_id is required."}), 400
+        if not isinstance(extracted_entities, dict) or not isinstance(
+            enrichment_data, dict
+        ):
+            return (
+                jsonify({
+                    "error": (
+                        "extracted_entities and enrichment_data must be JSON objects."
+                    )
+                }),
+                400,
+            )
+
+        try:
+            engine = SymbolicRatingEngine(
+                version=rule_version, gateway=shared_gateway
+            )
+            result = engine.calculate_premium(
+                quote_id=quote_id,
+                extracted_data=extracted_entities,
+                enrichment_data=enrichment_data,
+                appetite_decision=(
+                    str(appetite_decision) if appetite_decision else None
+                ),
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        return jsonify(result), 200
+
+    @flask_app.route("/api/quotes", methods=["GET"])
+    def list_quotes_endpoint() -> tuple[Response, int]:
+        raw_state = request.args.get("state")
+        session_id = request.args.get("session_id")
+        state_filter: QuoteLifecycleState | None = None
+        if raw_state:
+            try:
+                state_filter = QuoteLifecycleState(raw_state.upper())
+            except ValueError:
+                return jsonify({"error": f"Unknown quote state: {raw_state!r}"}), 400
+
+        quotes = shared_memory.list_quotes(
+            state=state_filter, session_id=session_id
+        )
+        return (
+            jsonify({
+                "quotes": quotes,
+                "counts_by_state": shared_memory.counts_by_state(),
+            }),
+            200,
+        )
+
+    @flask_app.route("/api/quotes/<quote_id>", methods=["GET"])
+    def get_quote_endpoint(quote_id: str) -> tuple[Response, int]:
+        try:
+            dossier = shared_memory.get_quote(quote_id)
+        except QuoteNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        return jsonify(dossier), 200
+
+    @flask_app.route("/api/quotes/<quote_id>/audit", methods=["GET"])
+    def export_audit_pack_endpoint(quote_id: str) -> tuple[Response, int]:
+        try:
+            dossier = shared_memory.get_quote(quote_id)
+        except QuoteNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+
+        audit_artifact = dossier.get("artifacts", {}).get("audit")
+        if not audit_artifact:
+            return (
+                jsonify({"error": f"Audit pack not yet generated for {quote_id}."}),
+                409,
+            )
+        return jsonify(audit_artifact), 200
+
+    @flask_app.route("/api/quotes/<quote_id>/decision", methods=["POST"])
+    def resolve_referral_endpoint(quote_id: str) -> tuple[Response, int]:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "Expected JSON object payload."}), 400
+
+        try:
+            resolution = UnderwriterResolution.model_validate(payload)
+        except ValidationError as exc:
+            return jsonify({"error": "Invalid decision payload.", "details": exc.errors()}), 400
+
+        try:
+            updated_dossier = shared_memory.apply_underwriter_resolution(
+                quote_id, resolution
+            )
+        except QuoteNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except InvalidLifecycleTransitionError as exc:
+            return jsonify({"error": str(exc)}), 409
+
+        # Re-seal the regulatory audit pack so the underwriter's decision is captured
+        artifacts: dict[str, Any] = dict(updated_dossier.get("artifacts", {}))
+        audit_agent = AuditComplianceAgent(gateway=shared_gateway)
+        refreshed_audit = audit_agent.build_audit_pack(quote_id, artifacts)
+        shared_memory.store_artifact(
+            quote_id,
+            artifact_key="audit",
+            artifact_payload=refreshed_audit,
+            author="AuditComplianceAgent",
+            summary=(
+                f"Re-sealed audit pack {refreshed_audit['audit_id']} following "
+                f"underwriter {resolution.action.value}."
+            ),
+        )
+        return jsonify(shared_memory.get_quote(quote_id)), 200
+
+    return flask_app
+
+
+# Default WSGI application instance preserving `from backend.app import app` compatibility.
+app = create_app()
+
+__all__ = ["SupervisorOrchestratorEngine", "app", "create_app"]
+
+
+if __name__ == "__main__":
+    cfg = app.config["UNDERWRITING_CONFIG"]
+    app.run(host=cfg.host, port=cfg.port, debug=False)

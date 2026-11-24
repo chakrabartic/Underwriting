@@ -1,0 +1,9 @@
+[project]
+name = "underwriting-explainable-workbench"
+version = "1.0.0"
+description = "Neuro-symbolic multi-agent commercial underwriting platform with mechanical grounding and SPIFFE authorization."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"

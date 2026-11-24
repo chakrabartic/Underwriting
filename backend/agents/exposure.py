@@ -1,74 +1,154 @@
-import logging
+"""Subagent D: Exposure & Risk Summary Agent.
+
+Synthesizes structured intake, appetite, enrichment, and deterministic rating
+traces into an explainable underwriting briefing using the modern Gemini
+Interactions API (`gemini-4-hydrogen`), mechanically gated by `GroundingGateway`
+to guarantee 0% uncited or numerically unattested claims (Specification 03).
+"""
+
+from __future__ import annotations
+
 import json
-from typing import Dict, Any
-from google import genai
-from google.genai import types
+import logging
+from typing import Any
+
+from backend.adapters import (
+    DeterministicGroundedSynthesizer,
+    GeminiInteractionsModelAdapter,
+)
+from backend.config import ExecutionMode
+from backend.grounding import CitationRegistry, GroundingGateway
+from backend.models import StructuredExposureBriefingSchema
+from backend.ports import LanguageModelPort
+from backend.security import AgentGatewayProxy
 
 logger = logging.getLogger(__name__)
 
+AGENT_NAME = "ExposureRiskSummaryAgent"
+
+
 class ExposureRiskSummaryAgent:
-    """
-    Subagent D: Exposure & Risk Summary Agent
-    Role: Synthesizes structured data from intake and enrichment into a holistic risk summary.
-    Constraints: Subject to rigorous groundedness checks.
-    """
-    def __init__(self, project_id: str, location: str):
+    """Produces mechanically grounded natural-language risk summaries."""
+
+    def __init__(
+        self,
+        project_id: str = "chayan-genai-bb",
+        location: str = "us-central1",
+        *,
+        model: str = "gemini-4-hydrogen",
+        execution_mode: ExecutionMode = ExecutionMode.LOCAL_SANDBOX,
+        llm_adapter: LanguageModelPort | None = None,
+        grounding_gateway: GroundingGateway | None = None,
+        gateway: AgentGatewayProxy | None = None,
+    ) -> None:
         self.project_id = project_id
         self.location = location
-        self._client_initialized = False
-        self.client = None
+        self._gateway = gateway
+        self._grounding_gateway = grounding_gateway or GroundingGateway(
+            strict_mode=False
+        )
 
-    def _init_client(self):
-        if not self._client_initialized:
-            try:
-                self.client = genai.Client(
-                    enterprise=True,
-                    project=self.project_id,
-                    location=self.location
-                )
-                self._client_initialized = True
-            except Exception as e:
-                logger.warning(f"Could not initialize GenAI client natively: {e}")
+        if llm_adapter is not None:
+            self._llm = llm_adapter
+        elif execution_mode == ExecutionMode.GCP_PRODUCTION:
+            self._llm = GeminiInteractionsModelAdapter(
+                project_id=project_id, location=location, model=model
+            )
+        else:
+            self._llm = DeterministicGroundedSynthesizer()
 
-    def synthesize(self, quote_id: str, extracted_data: Dict[str, Any], enrichment_data: Dict[str, Any]) -> Dict[str, Any]:
-        self._init_client()
-        logger.info(f"Synthesizing risk summary for quote: {quote_id}")
+    def synthesize(
+        self,
+        quote_id: str,
+        extracted_data: dict[str, Any],
+        enrichment_data: dict[str, Any],
+        *,
+        appetite_data: dict[str, Any] | None = None,
+        rating_data: dict[str, Any] | None = None,
+        citation_registry: CitationRegistry | None = None,
+    ) -> dict[str, Any]:
+        """Generates a risk summary and validates every claim through GroundingGateway."""
+        logger.info(
+            "Synthesizing grounded risk summary for quote_id=%s model=%s",
+            quote_id,
+            self._llm.model_name,
+        )
 
-        # Construct the context prompt for the model
-        context = {
+        registry = citation_registry or CitationRegistry.from_workflow_artifacts(
+            quote_id,
+            intake_extracted_data=extracted_data,
+            appetite_result=appetite_data,
+            enrichment_data=enrichment_data,
+            rating_result=rating_data,
+        )
+
+        rating_context: dict[str, Any] = {}
+        if rating_data:
+            version = rating_data.get("engine_version", "v1.4.2")
+            rating_context = {
+                "engine_version": version,
+                "adjusted_premium": rating_data.get("adjusted_premium"),
+                "risk_score": rating_data.get("risk_score"),
+                "decision": rating_data.get("decision"),
+                "rule_citation_uris": [
+                    f"rule://rating/{version}/{r}"
+                    for r in rating_data.get("execution_trace", [])
+                ],
+            }
+
+        context_payload = {
             "intake_data": extracted_data,
-            "enrichment_data": enrichment_data
+            "enrichment_data": enrichment_data,
+            "appetite_data": appetite_data or {},
+            "rating_data": rating_context,
+            "available_citations": {
+                uri: rec.to_dict() for uri, rec in registry.all_records().items()
+            },
         }
 
         system_instruction = (
-            "You are an expert underwriter assistant. Analyze the provided intake and enrichment data. "
-            "Write a concise, holistic risk summary. You must strictly ground every assertion in the provided data. "
-            "Do not hallucinate or invent details."
+            "You are a senior commercial insurance underwriting analyst. "
+            "Produce a concise risk briefing as a JSON list of assertions. "
+            "Every assertion MUST cite one or more exact `citation_uris` from "
+            "`available_citations` and MUST NOT state any number, rate, or fact "
+            "not explicitly present in those cited sources."
         )
+        prompt = f"CONTEXT_JSON:\n{json.dumps(context_payload, sort_keys=True)}"
+        schema = StructuredExposureBriefingSchema.model_json_schema()
 
-        prompt = f"Data:\n{json.dumps(context, indent=2)}\n\nPlease provide the summary."
+        def _invoke_model() -> str:
+            return self._llm.generate_structured_json(
+                system_instruction=system_instruction,
+                prompt=prompt,
+                json_schema=schema,
+            )
 
-        summary_text = "Mocked LLM Summary: The submission indicates moderate risk. The roof age is 22 years (masonry construction), and there was 1 claim in the past 5 years totaling $15,000. Revenue is $5.4M."
+        if self._gateway is None:
+            raw_json = _invoke_model()
+        else:
+            raw_json = self._gateway.authorize_and_execute(
+                agent_name=AGENT_NAME,
+                quote_id=quote_id,
+                tool_name="GeminiInteractions.SynthesizeRiskSummary",
+                required_scope="genai:synthesize_summary",
+                operation=_invoke_model,
+            )
 
-        if self.client:
-            try:
-                # Actual LLM call if credentials are valid
-                response = self.client.models.generate_content(
-                    model='gemini-2.5-pro',
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=0.1
-                    )
-                )
-                if response.text:
-                    summary_text = response.text
-            except Exception as e:
-                logger.warning(f"GenAI fallback to mock summary due to: {e}")
+        parsed_payload = json.loads(raw_json)
+        raw_assertions = parsed_payload.get("assertions", [])
+        validation_report = self._grounding_gateway.validate_assertions(
+            raw_assertions, registry
+        )
 
         return {
             "status": "COMPLETED",
-            "summary": summary_text,
-            "grounding_context_used": True # Signals that the grounding interceptor must check it
+            "summary": validation_report.render_summary_text(),
+            "assertions": [
+                a.model_dump(mode="json")
+                for a in validation_report.verified_assertions
+            ],
+            "grounding_context_used": True,
+            "grounding_verified": validation_report.is_fully_grounded,
+            "grounding_report": validation_report.to_dict(),
+            "model_used": self._llm.model_name,
         }
-

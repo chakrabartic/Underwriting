@@ -3,56 +3,115 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>A2UI Explainable Workbench</title>
+    <title>A2UI Explainable Underwriting Workbench</title>
     <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
-    <header>
-        <h1>A2UI Explainable AI Workbench</h1>
-        <div class="user-info">Underwriter Portal</div>
+    <header class="app-header">
+        <div class="brand-group">
+            <h1>A2UI Explainable AI Workbench</h1>
+            <span class="subtitle-pill">Neuro-Symbolic Commercial Underwriting</span>
+        </div>
+        <div class="header-actions">
+            <span id="stream-status-badge" class="status-badge idle">Idle</span>
+            <span class="user-info">Senior Underwriter Portal</span>
+        </div>
     </header>
 
-    <div class="main-container">
-        <!-- Topology Visualization Panel -->
-        <div class="panel topology-panel">
-            <div class="panel-header">Multi-Agent Mesh Topology</div>
-            <div id="topology-visualizer-container" class="terminal-content">
-                <p style="color: #888; text-align: center; margin-top: 50px;">Awaiting Orchestration Event Stream...</p>
-            </div>
+    <section class="lifecycle-strip" aria-label="Quote Lifecycle Summary">
+        <div class="lifecycle-counters" id="lifecycle-counters">
+            <div class="counter-chip" data-state="QUOTED_STP">STP Quoted: <strong>0</strong></div>
+            <div class="counter-chip" data-state="REFERRAL_QUEUE">Referral Queue: <strong>0</strong></div>
+            <div class="counter-chip" data-state="BOUND">Bound: <strong>0</strong></div>
+            <div class="counter-chip" data-state="DECLINED">Declined: <strong>0</strong></div>
+            <div class="counter-chip" data-state="INFO_REQUESTED">Info Requested: <strong>0</strong></div>
         </div>
+        <button id="refresh-quotes-btn" class="secondary-btn" type="button">Refresh Lifecycle</button>
+    </section>
 
-        <!-- Terminal & UI Delivery Panel -->
-        <div class="panel terminal-panel">
-            <div class="panel-header">Execution Trace & Dynamic Components</div>
-            <div id="chat-terminal-container" class="terminal-content">
-                <!-- Trace bubbles will be injected here -->
+    <main class="main-container">
+        <!-- Left Column: Quote Lifecycle Queue + Multi-Agent Mesh Topology -->
+        <aside class="panel sidebar-panel">
+            <div class="panel-header">Quote Lifecycle Queue (Zero-Orphan Store)</div>
+            <div id="quote-queue-container" class="queue-list">
+                <p class="empty-hint">No submissions processed in this session yet.</p>
             </div>
-            
+
+            <div class="panel-header border-top">Multi-Agent Mesh Topology</div>
+            <div id="topology-visualizer-container" class="terminal-content topology-list">
+                <p class="empty-hint">Awaiting orchestration event stream...</p>
+            </div>
+        </aside>
+
+        <!-- Center Column: Execution Trace, Dynamic A2UI Tabs, & Referral Console -->
+        <section class="panel terminal-panel">
+            <div class="panel-header">Execution Trace &amp; Dynamic A2UI Components</div>
+            <div id="chat-terminal-container" class="terminal-content"></div>
+
+            <!-- Human-in-the-Loop Referral & Audit Action Bar -->
+            <div id="hitl-referral-console" class="referral-console hidden">
+                <div class="referral-header">
+                    <strong id="referral-quote-label">Referral Console</strong>
+                    <button id="export-audit-btn" class="secondary-btn" type="button">Inspect Sealed Audit Pack</button>
+                </div>
+                <div class="referral-controls">
+                    <input
+                        type="text"
+                        id="underwriter-rationale-input"
+                        placeholder="Enter underwriting rationale (min 5 chars)..."
+                        maxlength="2000"
+                    />
+                    <button id="approve-bind-btn" class="success-btn" type="button">Approve &amp; Bind</button>
+                    <button id="request-info-btn" class="secondary-btn" type="button">Request Info</button>
+                    <button id="decline-quote-btn" class="danger-btn" type="button">Decline</button>
+                </div>
+            </div>
+
             <div class="action-bar">
-                <input type="text" id="prompt-input" value="Execute generic master workflow system pattern" style="flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px;" />
-                <button id="run-btn" class="primary">Launch Workflow</button>
+                <select id="scenario-select" aria-label="Submission Scenario">
+                    <option value="Evaluate commercial logistics submission for Acme Corp">Referral: Acme Corp Logistics ($5.4M)</option>
+                    <option value="Process low-risk retail bookstore STP submission">STP: Harborview Books LLC ($1.25M)</option>
+                    <option value="Evaluate hazmat pyrotechnics chemical submission">Decline: Apex Pyrotechnics HazMat ($18.5M)</option>
+                </select>
+                <input
+                    type="text"
+                    id="prompt-input"
+                    value="Evaluate commercial logistics submission for Acme Corp"
+                    aria-label="Orchestration Intent Prompt"
+                />
+                <button id="run-btn" class="primary" type="button">Launch Workflow</button>
             </div>
-        </div>
-    </div>
+        </section>
 
-    <!-- Load the Dynamic UI Engine -->
+        <!-- Right Column: Mechanical Grounding & Evidence Drill-Down Inspector -->
+        <aside class="panel inspector-panel">
+            <div class="panel-header">Mechanical Grounding &amp; Evidence Drill-Down</div>
+            <div id="evidence-inspector-container" class="terminal-content">
+                <p class="empty-hint">
+                    Click any citation badge or pricing factor row to inspect exact Document AI bounding boxes, Apigee JSON paths, or Symbolic Rule traces.
+                </p>
+            </div>
+        </aside>
+    </main>
+
     <script src="/static/js/app.js"></script>
     <script>
         document.addEventListener("DOMContentLoaded", () => {
             const engine = new MultiAgentDynamicUiEngine(
-                "/api/chat/stream", 
-                "chat-terminal-container", 
-                "topology-visualizer-container"
+                "/api/chat/stream",
+                "chat-terminal-container",
+                "topology-visualizer-container",
+                {
+                    evidenceInspectorId: "evidence-inspector-container",
+                    quoteQueueId: "quote-queue-container",
+                    lifecycleCountersId: "lifecycle-counters",
+                    statusBadgeId: "stream-status-badge",
+                    referralConsoleId: "hitl-referral-console",
+                }
             );
-
-            document.getElementById("run-btn").addEventListener("click", () => {
-                const prompt = document.getElementById("prompt-input").value;
-                document.getElementById("chat-terminal-container").innerHTML = ""; // Clear
-                // system-generated-durable-id
-                engine.establishOrchestrationStream(prompt, "session-12345");
-            });
+            engine.bindWorkbenchControls();
+            engine.refreshQuoteLifecycle();
         });
     </script>
 </body>
 </html>
-

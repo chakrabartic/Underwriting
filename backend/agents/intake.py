@@ -1,148 +1,163 @@
-import os
-import json
+"""Subagent A: Intake & Clearance Agent.
+
+Ingests unstructured policy submissions from Cloud Storage, extracts mechanically
+grounded entities (page + spatial bounding boxes) via Document AI, and registers
+the cleared quote in the Quote Lifecycle repository.
+"""
+
+from __future__ import annotations
+
 import logging
-from typing import Dict, Any, List
-from google.cloud import storage
-from google.cloud import documentai
-from google.cloud import bigquery
-from google import genai
+from typing import Any
+from urllib.parse import urlparse
+
+from backend.adapters import (
+    BigQueryQuoteRepository,
+    GcpDocumentAiExtractor,
+    SandboxDocumentExtractor,
+    SandboxQuoteRepository,
+)
+from backend.config import ExecutionMode
+from backend.models import GroundedValue, GroundingTrace, RawDocumentEntity
+from backend.ports import DocumentExtractorPort, QuoteRepositoryPort
+from backend.security import AgentGatewayProxy
 
 logger = logging.getLogger(__name__)
 
+AGENT_NAME = "IntakeClearanceAgent"
+
+
+def validate_gcs_uri(gcs_uri: str) -> str:
+    """Validates that `gcs_uri` is a well-formed `gs://<bucket>/<object>` URI."""
+    cleaned = gcs_uri.strip()
+    parsed = urlparse(cleaned)
+    if parsed.scheme != "gs" or not parsed.netloc or not parsed.path.strip("/"):
+        raise ValueError(
+            f"Invalid Cloud Storage URI {gcs_uri!r}; expected 'gs://<bucket>/<object>'."
+        )
+    return cleaned
+
+
 class IntakeClearanceAgent:
-    """
-    Subagent A: Intake & Clearance
-    Role: Ingests unstructured policy documents from Google Cloud Storage, 
-          extracts key entities using Document AI, and registers a new quote 
-          in the centralized Quote Lifecycle database (BigQuery).
-    Constraints: Purely extractive. Grounding enforced via Doc AI coordinates.
-    """
-    def __init__(self, project_id: str, location: str, processor_id: str, bq_dataset: str):
+    """Purely extractive intake agent binding every entity to Doc AI coordinates."""
+
+    def __init__(
+        self,
+        project_id: str = "chayan-genai-bb",
+        location: str = "us-central1",
+        processor_id: str = "underwriting-docai-extractor",
+        bq_dataset: str = "quote_lifecycle_db",
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.LOCAL_SANDBOX,
+        extractor: DocumentExtractorPort | None = None,
+        repository: QuoteRepositoryPort | None = None,
+        gateway: AgentGatewayProxy | None = None,
+    ) -> None:
         self.project_id = project_id
         self.location = location
         self.processor_id = processor_id
         self.bq_dataset = bq_dataset
-        
-        # Initialize GCP Clients
-        # Using placeholder instantiation to pass tests without ADC credentials in CI
-        self.storage_client = None 
-        self.docai_client = None
-        self.bq_client = None
-        
-        # Initialize Gemini Client for potential fallback semantic mapping
-        # following the strict AI Black Belt enterprise configuration
-        self.genai_client = None
-        
-        # Lazy initialization of clients to prevent crash on import
-        self._clients_initialized = False
+        self._gateway = gateway
 
-    def _initialize_clients(self):
-        if not self._clients_initialized:
-            try:
-                self.storage_client = storage.Client(project=self.project_id)
-                self.docai_client = documentai.DocumentProcessorServiceClient()
-                self.bq_client = bigquery.Client(project=self.project_id)
-                
-                # Using the modern unified Google Gen AI SDK
-                self.genai_client = genai.Client(
-                    enterprise=True,
-                    project=self.project_id,
-                    location=self.location
-                )
-                self._clients_initialized = True
-            except Exception as e:
-                logger.warning(f"Could not initialize GCP clients natively (expected in local dev): {e}")
+        if extractor is not None:
+            self._extractor = extractor
+        elif execution_mode == ExecutionMode.GCP_PRODUCTION:
+            self._extractor = GcpDocumentAiExtractor(
+                project_id=project_id, location="us", processor_id=processor_id
+            )
+        else:
+            self._extractor = SandboxDocumentExtractor()
 
-    def process_submission(self, gcs_uri: str, quote_id: str) -> Dict[str, Any]:
-        """
-        Orchestrates the intake workflow: 
-        Extraction -> Grounding Mapping -> BigQuery Registration
-        """
-        self._initialize_clients()
-        logger.info(f"Intake Agent initiated for quote: {quote_id}, source: {gcs_uri}")
-        
-        # 1. Process with Doc AI to enforce mechanical grounding (bounding boxes)
-        document_entities = self._extract_with_doc_ai(gcs_uri)
-        
-        # 2. Parse extracted entities into a strictly structured format
-        structured_data = self._parse_and_ground_entities(document_entities)
-        
-        # 3. Register the quote in BigQuery
-        self._register_in_bigquery(quote_id, gcs_uri, structured_data)
-        
-        # 4. Return the standardized payload for the Supervisor Agent
+        if repository is not None:
+            self._repository = repository
+        elif execution_mode == ExecutionMode.GCP_PRODUCTION:
+            self._repository = BigQueryQuoteRepository(
+                project_id=project_id, dataset_id=bq_dataset
+            )
+        else:
+            self._repository = SandboxQuoteRepository(dataset_id=bq_dataset)
+
+    def process_submission(self, gcs_uri: str, quote_id: str) -> dict[str, Any]:
+        """Extracts grounded entities from `gcs_uri` and registers `quote_id`."""
+        normalized_uri = validate_gcs_uri(gcs_uri)
+        if not quote_id or not quote_id.strip():
+            raise ValueError("quote_id must be a non-empty identifier.")
+
+        logger.info(
+            "IntakeClearanceAgent started quote_id=%s source_uri=%s",
+            quote_id,
+            normalized_uri,
+        )
+
+        entities = self._run_tool(
+            quote_id=quote_id,
+            tool_name="DocumentAI.ProcessDocument",
+            required_scope="docai:extract_entities",
+            operation=lambda: self._extractor.extract_entities(normalized_uri, quote_id),
+        )
+        structured_data = self._parse_and_ground_entities(quote_id, entities)
+
+        self._run_tool(
+            quote_id=quote_id,
+            tool_name="BigQuery.RegisterQuote",
+            required_scope="bigquery:register_quote",
+            operation=lambda: self._repository.register_quote(
+                quote_id, normalized_uri, structured_data
+            ),
+        )
+
         return {
             "quote_id": quote_id,
             "status": "CLEARED",
             "extracted_data": structured_data,
-            "source_uri": gcs_uri
+            "source_uri": normalized_uri,
         }
 
-    def _extract_with_doc_ai(self, gcs_uri: str) -> List[Dict[str, Any]]:
-        """
-        Simulates interacting with GCP Document AI to extract entities.
-        Returns mocked grounded coordinates to ensure 0% hallucination compliance.
-        """
-        # In a real implementation:
-        # name = self.docai_client.processor_path(self.project_id, self.location, self.processor_id)
-        # request = documentai.ProcessRequest(name=name, gcs_document=...)
-        # result = self.docai_client.process_document(request=request)
-        
-        logger.info(f"Extracting entities from {gcs_uri} via Document AI")
-        
-        # Mocked grounded response
-        return [
-            {
-                "type": "BUSINESS_NAME",
-                "mention_text": "Acme Corp Logistics",
-                "confidence": 0.98,
-                "page": 1,
-                "bounding_box": {"x": 100, "y": 150}
-            },
-            {
-                "type": "PROPERTY_ADDRESS",
-                "mention_text": "123 Industrial Way, Chicago, IL 60601",
-                "confidence": 0.95,
-                "page": 1,
-                "bounding_box": {"x": 100, "y": 200}
-            },
-            {
-                "type": "REVENUE",
-                "mention_text": "$5,400,000",
-                "confidence": 0.92,
-                "page": 2,
-                "bounding_box": {"x": 300, "y": 450}
-            }
-        ]
+    def _run_tool(
+        self,
+        *,
+        quote_id: str,
+        tool_name: str,
+        required_scope: str,
+        operation: Any,
+    ) -> Any:
+        if self._gateway is None:
+            return operation()
+        return self._gateway.authorize_and_execute(
+            agent_name=AGENT_NAME,
+            quote_id=quote_id,
+            tool_name=tool_name,
+            required_scope=required_scope,
+            operation=operation,
+        )
 
-    def _parse_and_ground_entities(self, doc_entities: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Converts the raw Doc AI entities into a canonical business object,
-        retaining the grounding trace (coordinates/page) for the A2UI workbench.
-        """
-        structured_data = {}
+    @staticmethod
+    def _parse_and_ground_entities(
+        quote_id: str, doc_entities: list[RawDocumentEntity]
+    ) -> dict[str, Any]:
+        """Normalizes raw Document AI spans into canonical grounded fields."""
+        structured_data: dict[str, Any] = {}
         for entity in doc_entities:
-            # Map the type to a standard schema key
-            key = entity["type"].lower()
+            key = entity.type.strip().lower()
+            citation_uri = f"docai://{quote_id}/page/{entity.page}/{key}"
+            grounded = GroundedValue(
+                value=entity.mention_text,
+                grounding_trace=GroundingTrace(
+                    source="DOC_AI",
+                    citation_uri=citation_uri,
+                    page=entity.page,
+                    bounding_box=dict(entity.bounding_box),
+                    confidence=entity.confidence,
+                ),
+            )
             structured_data[key] = {
-                "value": entity["mention_text"],
+                "value": grounded.value,
                 "grounding_trace": {
                     "source": "DOC_AI",
-                    "page": entity["page"],
-                    "bounding_box": entity["bounding_box"],
-                    "confidence": entity["confidence"]
-                }
+                    "citation_uri": citation_uri,
+                    "page": entity.page,
+                    "bounding_box": dict(entity.bounding_box),
+                    "confidence": entity.confidence,
+                },
             }
         return structured_data
-
-    def _register_in_bigquery(self, quote_id: str, gcs_uri: str, payload: Dict[str, Any]):
-        """
-        Inserts the cleared quote payload into the Quote Lifecycle Database.
-        """
-        # In a real implementation:
-        # table_id = f"{self.project_id}.{self.bq_dataset}.quotes"
-        # errors = self.bq_client.insert_rows_json(table_id, [row])
-        
-        logger.info(f"Registered quote {quote_id} in BigQuery dataset {self.bq_dataset}")
-        return True
-
